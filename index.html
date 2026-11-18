@@ -784,17 +784,31 @@ function gisReady() {
   })));
 }
 
-function gConnect() {
+async function gConnect(forceConsent = false) {
+  await gisReady();
   return new Promise(((res, rej) => {
-    if (!(window.google && google.accounts && google.accounts.oauth2)) {
-      gisReady().catch((() => {}));
-      return rej(new Error("Google non è ancora pronto: riprova tra un attimo."));
-    }
+    let settled = false;
+    const ok = () => {
+      if (!settled) {
+        settled = true;
+        res();
+      }
+    }, ko = e => {
+      if (!settled) {
+        settled = true;
+        rej(e);
+      }
+    };
     const tc = google.accounts.oauth2.initTokenClient({
       client_id: clientId(),
       scope: SCOPE,
       callback: r => {
-        if (r.error) return rej(new Error(r.error_description || r.error));
+        if (r.error) return ko(new Error(r.error_description || r.error));
+        if (!google.accounts.oauth2.hasGrantedAllScopes(r, SCOPE)) {
+          CFG.granted = false;
+          saveCfg();
+          return ko(new Error("Non hai dato il permesso a Google Drive: riprova e spunta la casella di Drive nella finestra di Google."));
+        }
         G.token = r.access_token;
         G.exp = Date.now() + (Number(r.expires_in || 3600) - 90) * 1e3;
         lsSet("haccp_tok", JSON.stringify({
@@ -803,15 +817,68 @@ function gConnect() {
         }));
         CFG.granted = true;
         saveCfg();
-        res();
+        ok();
       },
-      error_callback: e => rej(new Error(e && e.type === "popup_closed" ? "Accesso annullato." : e && e.type === "popup_failed_to_open" ? "Il browser ha bloccato la finestra di Google: consenti i popup e riprova." : "Accesso a Google non riuscito."))
+      error_callback: e => {
+        if (e && e.type === "popup_failed_to_open") {
+          settled = true;
+          gConnectRedirect(forceConsent);
+          return;
+        }
+        if (e && e.type === "popup_closed") return;
+        ko(new Error("Accesso a Google non riuscito."));
+      }
     });
     tc.requestAccessToken({
-      prompt: CFG.granted ? "" : "consent"
+      prompt: forceConsent ? "consent" : ""
     });
   }));
 }
+
+function gConnectRedirect(forceConsent = false) {
+  const q = new URLSearchParams({
+    client_id: clientId(),
+    redirect_uri: location.origin + location.pathname,
+    response_type: "token",
+    scope: SCOPE,
+    include_granted_scopes: "true"
+  });
+  if (forceConsent || !CFG.granted) q.set("prompt", "consent");
+  persist();
+  saveCfg();
+  location.assign("https://accounts.google.com/o/oauth2/v2/auth?" + q.toString());
+}
+
+function consumeRedirectToken() {
+  const h = location.hash.slice(1);
+  if (!/(^|&)(access_token|error)=/.test(h)) return false;
+  const p = new URLSearchParams(h);
+  try {
+    history.replaceState(null, "", location.pathname + location.search);
+  } catch {}
+  if (p.get("error")) {
+    setTimeout((() => toast(p.get("error") === "access_denied" ? "Accesso a Google annullato." : "Accesso a Google non riuscito (" + p.get("error") + ").", true)), 300);
+    return false;
+  }
+  if (!(p.get("scope") || "").includes("drive.file")) {
+    CFG.granted = false;
+    saveCfg();
+    setTimeout((() => toast("Non hai dato il permesso a Google Drive: riprova e spunta la casella di Drive.", true)), 300);
+    return false;
+  }
+  G.token = p.get("access_token");
+  G.exp = Date.now() + (Number(p.get("expires_in") || 3600) - 90) * 1e3;
+  lsSet("haccp_tok", JSON.stringify({
+    token: G.token,
+    exp: G.exp
+  }));
+  CFG.granted = true;
+  CFG.mode = "drive";
+  saveCfg();
+  return true;
+}
+
+let lastErrMsg = "";
 
 async function gapi(path, {method: method = "GET", body: body, headers: headers, raw: raw, upload: upload} = {}) {
   const r = await fetch((upload ? "https://www.googleapis.com/upload/drive/v3/" : "https://www.googleapis.com/drive/v3/") + path, {
@@ -833,6 +900,11 @@ async function gapi(path, {method: method = "GET", body: body, headers: headers,
     const e = new Error("http " + r.status);
     e.status = r.status;
     e.body = await r.text().catch((() => ""));
+    try {
+      lastErrMsg = JSON.parse(e.body).error.message || "";
+    } catch {
+      lastErrMsg = "errore " + r.status;
+    }
     throw e;
   }
   return raw ? r : r.status === 204 ? {} : r.json();
@@ -3409,11 +3481,12 @@ const ACT = {
   },
   "g-connect": async () => {
     try {
-      await gConnect();
+      await gConnect(!CFG.granted);
       setSync();
-      await sync();
+      lastErrMsg = "";
+      const ok = await sync();
       refresh();
-      toast("Google Drive collegato.");
+      toast(ok ? "Google Drive collegato." : "Google Drive non risponde" + (lastErrMsg ? ": " + lastErrMsg : "."), !ok);
     } catch (e) {
       toast(e.message || "Accesso a Google non riuscito.", true);
     }
@@ -3611,21 +3684,36 @@ function gateSetup() {
 
 function gateGoogle() {
   gisReady().catch((() => {}));
-  showGate(`<span class="eyebrow">Registro HACCP · Bar</span><h1>Collega Google Drive</h1>\n    <p>Accedi con l’account Google del bar. L’app vede solo i file che crea lei: una cartella “${esc(DRIVE_FOLDER)}” con i dati e gli allegati.</p>\n    ${location.protocol === "file:" ? '<p class="note warn">Hai aperto il file dal computer: l’accesso a Google funziona solo dall’indirizzo online dell’app.</p>' : ""}\n    <button class="btn primary" type="button" id="gGo">Accedi con Google</button>\n    <button class="link" type="button" id="gBack">Cambia impostazione</button>`);
+  showGate(`<span class="eyebrow">Registro HACCP · Bar</span><h1>Collega Google Drive</h1>\n    <p>Accedi con l’account Google del bar. L’app vede solo i file che crea lei: una cartella “${esc(DRIVE_FOLDER)}” con i dati e gli allegati.</p>\n    ${location.protocol === "file:" ? '<p class="note warn">Hai aperto il file dal computer: l’accesso a Google funziona solo dall’indirizzo online dell’app.</p>' : ""}\n    <button class="btn primary" type="button" id="gGo">Accedi con Google</button>\n    <button class="btn" type="button" id="gGoRedir">Accedi nella stessa scheda (iPhone / Incognito)</button>\n    <button class="link" type="button" id="gBack">Cambia impostazione</button>`);
+  const reset = () => {
+    const b = $("#gGo");
+    if (b) {
+      b.disabled = false;
+      b.textContent = "Accedi con Google";
+    }
+  };
   $("#gGo").onclick = async () => {
     const b = $("#gGo");
     b.disabled = true;
     b.textContent = "Collego…";
     try {
-      await gConnect();
-      await sync();
-      boot(true);
+      await gConnect(!CFG.granted);
     } catch (e) {
       toast(e.message || "Accesso a Google non riuscito.", true);
-      b.disabled = false;
-      b.textContent = "Accedi con Google";
+      reset();
+      return;
     }
+    lastErrMsg = "";
+    const ok = await sync();
+    if (!ok && !tokenOk()) {
+      toast("Google Drive non risponde" + (lastErrMsg ? ": " + lastErrMsg : "."), true);
+      reset();
+      return;
+    }
+    if (!ok && lastErrMsg) toast("Attenzione, Google Drive: " + lastErrMsg, true);
+    boot(true);
   };
+  $("#gGoRedir").onclick = () => gConnectRedirect(false);
   $("#gBack").onclick = () => {
     CFG.mode = "";
     saveCfg();
@@ -3690,6 +3778,8 @@ applyTheme();
 setInterval(applyTheme, 6e4);
 
 loadLocal();
+
+consumeRedirectToken();
 
 boot();
 /* — Kosta — */
